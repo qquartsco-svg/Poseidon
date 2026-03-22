@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "marine-autonomy"
+version = "0.1.0"
+description = "Autonomous Vessel Dynamics Engine — LOS Guidance x COLREGs x EKF"
+readme = "README.md"
+requires-python = ">=3.8"
+dependencies = []
+
+[project.optional-dependencies]
+full = ["autonomy-runtime-stack"]
+dev  = ["pytest>=7"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["marine_autonomy*"]
