@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 from .contracts.schemas import VesselState
 
@@ -203,3 +203,166 @@ class LOSGuidance:
         dx = state.x_m - wp_from[0]
         dy = state.y_m - wp_from[1]
         return -dx * math.sin(alpha) + dy * math.cos(alpha)
+
+
+# ---------------------------------------------------------------------------
+# Maritime A* path planner
+# ---------------------------------------------------------------------------
+
+@dataclass
+class DepthChart:
+    """수심도 — A* 경로 계획용 (depth chart for path planning).
+
+    grid          — 2D list[list[float]], depth in meters at each cell
+    origin_x      — world x-coordinate of grid cell (0, 0)
+    origin_y      — world y-coordinate of grid cell (0, 0)
+    resolution_m  — meters per grid cell
+    min_depth_m   — minimum additional clearance required above draft
+    """
+
+    grid: list           # 2D list[list[float]]
+    origin_x: float = 0.0
+    origin_y: float = 0.0
+    resolution_m: float = 10.0   # meters per cell
+    min_depth_m: float = 3.0     # minimum safe water depth margin
+
+    def world_to_cell(self, x: float, y: float) -> Tuple[int, int]:
+        """Convert world (x, y) to (row, col) grid indices."""
+        col = int((x - self.origin_x) / self.resolution_m)
+        row = int((y - self.origin_y) / self.resolution_m)
+        return row, col
+
+    def cell_to_world(self, row: int, col: int) -> Tuple[float, float]:
+        """Convert (row, col) grid indices to world (x, y) cell centre."""
+        x = self.origin_x + col * self.resolution_m + self.resolution_m / 2
+        y = self.origin_y + row * self.resolution_m + self.resolution_m / 2
+        return x, y
+
+    def is_passable(self, row: int, col: int, draft_m: float = 1.5) -> bool:
+        """Return True if the cell has sufficient depth for the given draft."""
+        rows = len(self.grid)
+        if rows == 0:
+            return False
+        cols = len(self.grid[0])
+        if not (0 <= row < rows and 0 <= col < cols):
+            return False
+        return self.grid[row][col] >= (draft_m + self.min_depth_m)
+
+
+def _nearest_passable(
+    depth_chart: DepthChart,
+    cell: Tuple[int, int],
+    draft_m: float,
+    search_radius: int = 10,
+) -> Optional[Tuple[int, int]]:
+    """Find nearest passable cell when start/goal cell has insufficient depth."""
+    r0, c0 = cell
+    for radius in range(1, search_radius + 1):
+        for dr in range(-radius, radius + 1):
+            for dc in range(-radius, radius + 1):
+                if abs(dr) == radius or abs(dc) == radius:
+                    nb = (r0 + dr, c0 + dc)
+                    if depth_chart.is_passable(nb[0], nb[1], draft_m):
+                        return nb
+    return None
+
+
+def maritime_astar(
+    depth_chart: DepthChart,
+    start_xy: Tuple[float, float],
+    goal_xy: Tuple[float, float],
+    draft_m: float = 1.5,
+    allow_diagonal: bool = True,
+) -> list:
+    """Maritime A* path planner — obstacle avoidance via depth chart.
+
+    Finds the lowest-cost path from start to goal on a depth grid.
+    Cells with insufficient depth (< draft + min_depth_m) are impassable.
+    Deep cells are preferred via a depth bonus in the cost function.
+
+    Heuristic: Euclidean distance (diagonal allowed) or Manhattan distance.
+
+    Parameters
+    ----------
+    depth_chart   — DepthChart with grid depth data
+    start_xy      — (x, y) world-coordinate start position
+    goal_xy       — (x, y) world-coordinate goal position
+    draft_m       — vessel draft (m); used for passability check
+    allow_diagonal — permit 8-directional movement (True) or 4-directional
+
+    Returns
+    -------
+    list of (x, y) world-coordinate waypoints along the path.
+    Returns empty list if no path exists.
+    """
+    import heapq
+
+    start_cell = depth_chart.world_to_cell(*start_xy)
+    goal_cell  = depth_chart.world_to_cell(*goal_xy)
+
+    rows = len(depth_chart.grid)
+    cols = len(depth_chart.grid[0]) if rows > 0 else 0
+
+    # Handle impassable start / goal cells
+    if not depth_chart.is_passable(start_cell[0], start_cell[1], draft_m):
+        start_cell = _nearest_passable(depth_chart, start_cell, draft_m)
+        if start_cell is None:
+            return []
+
+    if not depth_chart.is_passable(goal_cell[0], goal_cell[1], draft_m):
+        goal_cell = _nearest_passable(depth_chart, goal_cell, draft_m)
+        if goal_cell is None:
+            return []
+
+    # Same cell — trivial path
+    if start_cell == goal_cell:
+        return [depth_chart.cell_to_world(*start_cell)]
+
+    # Movement directions
+    if allow_diagonal:
+        neighbors  = [(-1, -1), (-1, 0), (-1, 1), (0, -1),
+                      (0,  1), ( 1, -1), ( 1, 0), ( 1,  1)]
+        step_costs = [1.4142, 1.0, 1.4142, 1.0,
+                      1.0,    1.4142, 1.0, 1.4142]
+    else:
+        neighbors  = [(-1, 0), (1, 0), (0, -1), (0, 1)]
+        step_costs = [1.0, 1.0, 1.0, 1.0]
+
+    def heuristic(a: Tuple[int, int], b: Tuple[int, int]) -> float:
+        return math.sqrt((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2)
+
+    open_set: list = [(0.0, start_cell)]
+    came_from: dict = {}
+    g_score: dict = {start_cell: 0.0}
+
+    while open_set:
+        _, current = heapq.heappop(open_set)
+
+        if current == goal_cell:
+            # Reconstruct path
+            path_cells = []
+            while current in came_from:
+                path_cells.append(current)
+                current = came_from[current]
+            path_cells.append(start_cell)
+            path_cells.reverse()
+            return [depth_chart.cell_to_world(r, c) for r, c in path_cells]
+
+        r, c = current
+        for (dr, dc), cost in zip(neighbors, step_costs):
+            nb = (r + dr, c + dc)
+            if not depth_chart.is_passable(nb[0], nb[1], draft_m):
+                continue
+
+            # Depth bonus: deeper water = lower cost
+            depth = depth_chart.grid[nb[0]][nb[1]]
+            depth_penalty = max(0.0, 1.0 - (depth - draft_m) / 10.0) * 0.2
+
+            new_g = g_score[current] + cost + depth_penalty
+            if new_g < g_score.get(nb, float("inf")):
+                came_from[nb] = current
+                g_score[nb] = new_g
+                f = new_g + heuristic(nb, goal_cell)
+                heapq.heappush(open_set, (f, nb))
+
+    return []  # No path found

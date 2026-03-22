@@ -114,3 +114,129 @@ PRESET_REGISTRY: Dict[str, MarinePreset] = {
 def get_preset(name: str) -> MarinePreset:
     """Return the named preset, falling back to 'coastal' if not found."""
     return PRESET_REGISTRY.get(name, PRESET_REGISTRY["coastal"])
+
+
+# ---------------------------------------------------------------------------
+# Hull-class preset registry (universal maritime engine)
+# ---------------------------------------------------------------------------
+
+HULL_PRESETS: Dict[str, Dict[str, MarinePreset]] = {
+    "surface_vessel": {
+        "coastal": PRESET_REGISTRY["coastal"],
+        "harbor":  PRESET_REGISTRY["harbor"],
+    },
+    "submarine": {
+        "shallow": MarinePreset(
+            name="sub_shallow",
+            max_speed_ms=5.144,
+            cruise_speed_ms=3.086,
+            lookahead_m=100.0,
+            acceptance_radius_m=30.0,
+            safe_range_m=500.0,
+            action_range_m=1000.0,
+            emergency_range_m=100.0,
+            draft_m=5.0,
+            description="잠수함 천해 작전 — 10kn",
+        ),
+        "deep": MarinePreset(
+            name="sub_deep",
+            max_speed_ms=10.288,
+            cruise_speed_ms=7.716,
+            lookahead_m=300.0,
+            acceptance_radius_m=100.0,
+            safe_range_m=2000.0,
+            action_range_m=5000.0,
+            emergency_range_m=200.0,
+            draft_m=8.0,
+            description="잠수함 심해 순항 — 20kn",
+        ),
+    },
+    "yacht": {
+        "racing": MarinePreset(
+            name="yacht_racing",
+            max_speed_ms=8.230,
+            cruise_speed_ms=6.173,
+            lookahead_m=60.0,
+            acceptance_radius_m=20.0,
+            safe_range_m=300.0,
+            action_range_m=600.0,
+            emergency_range_m=40.0,
+            draft_m=1.8,
+            description="레이싱 요트 — 16kn",
+        ),
+        "cruising": MarinePreset(
+            name="yacht_cruising",
+            max_speed_ms=5.144,
+            cruise_speed_ms=3.601,
+            lookahead_m=50.0,
+            acceptance_radius_m=15.0,
+            safe_range_m=200.0,
+            action_range_m=400.0,
+            emergency_range_m=30.0,
+            draft_m=1.5,
+            description="크루징 요트 — 10kn",
+        ),
+    },
+    "boat": {
+        "patrol": MarinePreset(
+            name="boat_patrol",
+            max_speed_ms=15.432,
+            cruise_speed_ms=10.288,
+            lookahead_m=40.0,
+            acceptance_radius_m=10.0,
+            safe_range_m=150.0,
+            action_range_m=300.0,
+            emergency_range_m=20.0,
+            draft_m=0.8,
+            description="고속 순찰정 — 30kn",
+        ),
+        "harbor": MarinePreset(
+            name="boat_harbor",
+            max_speed_ms=2.572,
+            cruise_speed_ms=1.543,
+            lookahead_m=15.0,
+            acceptance_radius_m=5.0,
+            safe_range_m=50.0,
+            action_range_m=100.0,
+            emergency_range_m=10.0,
+            draft_m=0.6,
+            description="항만 보트 — 5kn",
+        ),
+    },
+    "autonomous_usv": {
+        "survey": MarinePreset(
+            name="usv_survey",
+            max_speed_ms=3.086,
+            cruise_speed_ms=2.057,
+            lookahead_m=20.0,
+            acceptance_radius_m=5.0,
+            safe_range_m=100.0,
+            action_range_m=200.0,
+            emergency_range_m=15.0,
+            draft_m=0.4,
+            description="수중 탐사 USV — 6kn",
+        ),
+    },
+}
+
+
+def get_hull_preset(hull_class: str, scenario: str) -> MarinePreset:
+    """Return a hull-class specific operating preset.
+
+    Parameters
+    ----------
+    hull_class  — one of "surface_vessel", "submarine", "yacht", "boat",
+                  "autonomous_usv"
+    scenario    — scenario key within the hull class (e.g. "deep", "racing")
+
+    Falls back to "surface_vessel" / "coastal" if not found.
+
+    Example::
+
+        get_hull_preset("submarine", "deep")  # → sub_deep preset
+        get_hull_preset("yacht", "racing")    # → yacht_racing preset
+    """
+    return HULL_PRESETS.get(hull_class, {}).get(
+        scenario,
+        HULL_PRESETS["surface_vessel"]["coastal"],
+    )

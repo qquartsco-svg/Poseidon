@@ -1,23 +1,26 @@
 """
-VesselOrchestrator — tick-based marine autonomy controller.
+VesselOrchestrator — hull-class aware, tick-based marine autonomy controller.
 
 Mirrors the AutonomyOrchestrator pattern from the sibling
-Autonomy_Runtime_Stack, adapted for 3-DOF vessel dynamics.
+Autonomy_Runtime_Stack, adapted for 3-DOF (surface) / 4-DOF (submarine)
+vessel dynamics.
 
 One tick comprises:
   1.  EKF prediction + optional sensor fusion
-  2.  COLREGs behaviour assessment
-  3.  LOS guidance → desired rudder
+  2.  COLREGs multi-vessel behaviour assessment
+  3.  LOS guidance → desired rudder + COLREGs heading offset
   4.  Speed / thrust PID
-  5.  Ω (omega) safety capability multiplier
-  6.  Actuator normalisation and verdict emission
+  5.  Submarine depth control (hull_class == "submarine")
+  6.  Ω (omega) safety capability multiplier
+  7.  Actuator normalisation and verdict emission
 
 Ω model:
   ω_risk  = 0.55 if risk > 0.85 else 0.78 if risk > 0.35 else 1.0
   ω_fuel  = 0.70 if fuel_level < 0.2   else 1.0
   ω_vis   = 0.80 if visibility_m < 200  else 1.0
   ω_depth = 0.65 if depth_m < 3·draft_m else 1.0
-  Ω       = ω_risk × ω_fuel × ω_vis × ω_depth
+  ω_contacts = 0.90 if n_contacts >= 3 else 1.0   (multi-contact risk)
+  Ω       = ω_risk × ω_fuel × ω_vis × ω_depth × ω_contacts
 
 Speed PID (surge control):
   error  = target_speed − u
@@ -34,11 +37,14 @@ from .contracts.schemas import (
     VesselState,
     VesselActuator,
     VesselCommand,
+    DisturbanceState,
+    HullClass,
 )
 from .guidance import LOSGuidance, LOSConfig
 from .colregs import COLREGsBehavior, COLREGsConfig
 from .estimation import MarineEKF
 from .presets import MarinePreset, get_preset
+from .dynamics import submarine_depth_step
 
 
 # ---------------------------------------------------------------------------
@@ -62,7 +68,7 @@ def _normalize_angle(a: float) -> float:
 # ---------------------------------------------------------------------------
 
 class VesselOrchestrator:
-    """Tick-based vessel autonomy controller.
+    """Tick-based vessel autonomy controller — universal hull classes.
 
     Usage::
 
@@ -89,7 +95,9 @@ class VesselOrchestrator:
         use_ekf: bool = True,
         fuel_level: float = 1.0,
     ) -> None:
-        self._preset: MarinePreset = get_preset(preset) if isinstance(preset, str) else (preset or get_preset("coastal"))
+        self._preset: MarinePreset = (
+            get_preset(preset) if isinstance(preset, str) else (preset or get_preset("coastal"))
+        )
         self._los = LOSGuidance(
             LOSConfig(
                 lookahead_m=self._preset.lookahead_m,
@@ -109,6 +117,10 @@ class VesselOrchestrator:
         self._u_prev: float = 0.0
         self._t_s: float = 0.0
 
+        # Submarine depth state
+        self._depth_m: float = 0.0
+        self._w_ms: float = 0.0
+
     # ------------------------------------------------------------------
     # Public tick interface
     # ------------------------------------------------------------------
@@ -127,8 +139,7 @@ class VesselOrchestrator:
         if state is None:
             state = VesselState()
 
-        # Resolve the numeric state (VesselState or StateEstimate both have
-        # x_m, y_m, psi_rad, u_ms attributes)
+        # Resolve numeric state fields
         x_m = state.x_m
         y_m = state.y_m
         psi_rad = state.psi_rad
@@ -145,7 +156,6 @@ class VesselOrchestrator:
             ekf.update_heading(psi_rad)
             ekf.update_speed(u_ms)
             est = ekf.estimate()
-            # Feed EKF estimate back as state for downstream modules
             fused_state = VesselState(
                 x_m=est.x_m,
                 y_m=est.y_m,
@@ -163,21 +173,22 @@ class VesselOrchestrator:
             est = None
 
         # ----------------------------------------------------------------
-        # 2. COLREGs behaviour
+        # 2. COLREGs multi-vessel behaviour
         # ----------------------------------------------------------------
         colregs_result = self._colregs.tick(
             fused_state, ctx.perception, self._colregs_config
         )
         colregs_state = colregs_result["state"]
-        avoid_offset = colregs_result["avoid_heading_offset_rad"]
+        avoid_offset  = colregs_result.get("avoid_heading_offset_rad", 0.0)
         emergency_stop = colregs_result["stop"]
+        n_contacts = len(colregs_result.get("situations", []))
 
         # ----------------------------------------------------------------
-        # 3. LOS guidance → desired rudder
+        # 3. LOS guidance + COLREGs heading offset
         # ----------------------------------------------------------------
         if not emergency_stop and len(ctx.waypoints) > 0:
             rudder_rad = self._los.update(fused_state, ctx.waypoints)
-            # Apply COLREGs heading offset (positive = starboard = positive rudder)
+            # Apply COLREGs avoidance offset (positive = starboard = positive rudder)
             rudder_rad = _clamp(
                 rudder_rad + avoid_offset,
                 -self._los._config.max_rudder_rad,
@@ -206,12 +217,41 @@ class VesselOrchestrator:
         self._t_s += dt_s
 
         # ----------------------------------------------------------------
-        # 5. Ω (omega) safety multiplier
+        # 5. Submarine depth control (hull_class == "submarine")
         # ----------------------------------------------------------------
-        risk_score = ctx.risk_score
+        hull_class = ctx.hull_class
+        new_depth = self._depth_m
+        new_w = self._w_ms
+        if hull_class == HullClass.SUBMARINE or (
+            hasattr(hull_class, "value") and hull_class.value == "submarine"
+        ) or hull_class == "submarine":
+            # Determine target depth from perception or keep current
+            target_depth = getattr(ctx, "_target_depth_m", 0.0)
+            # Simple PD depth params
+            from .dynamics import VesselParams
+            sub_p = VesselParams(hull_class="submarine", Kz=5.0, Bz=20.0)
+
+            class _DepthState:
+                def __init__(self, d, w):
+                    self.depth_m = d
+                    self.w_ms = w
+
+            new_depth, new_w = submarine_depth_step(
+                _DepthState(self._depth_m, self._w_ms),
+                target_depth,
+                sub_p,
+                dt_s,
+            )
+            self._depth_m = new_depth
+            self._w_ms = new_w
+
+        # ----------------------------------------------------------------
+        # 6. Ω (omega) safety multiplier
+        # ----------------------------------------------------------------
+        risk_score  = ctx.risk_score
         visibility_m = ctx.perception.visibility_m
-        depth_m = ctx.perception.depth_m
-        draft_m = self._preset.draft_m
+        depth_m     = ctx.perception.depth_m
+        draft_m     = self._preset.draft_m
 
         omega = _compute_omega(
             risk_score=risk_score,
@@ -219,21 +259,21 @@ class VesselOrchestrator:
             visibility_m=visibility_m,
             depth_m=depth_m,
             draft_m=draft_m,
+            n_contacts=n_contacts,
         )
 
         # Scale thrust by Ω
         thrust_n *= omega
 
-        # Verdict
         verdict = _omega_to_verdict(omega)
 
         # ----------------------------------------------------------------
-        # 6. Actuator normalisation
+        # 7. Actuator normalisation
         # ----------------------------------------------------------------
         max_thrust = 8000.0
         max_rudder = 0.6109
 
-        reverse = thrust_n < 0.0
+        reverse  = thrust_n < 0.0
         throttle = abs(thrust_n) / max_thrust
         throttle = _clamp(throttle, 0.0, 1.0)
         rudder_norm = _clamp(rudder_rad / max_rudder, -1.0, 1.0)
@@ -247,7 +287,7 @@ class VesselOrchestrator:
         # ----------------------------------------------------------------
         # Build and return updated context
         # ----------------------------------------------------------------
-        from .contracts.schemas import MarineTickContext as _Ctx, MarinePerception
+        from .contracts.schemas import MarineTickContext as _Ctx
 
         new_ctx = _Ctx(
             state=fused_state,
@@ -260,6 +300,8 @@ class VesselOrchestrator:
             verdict=verdict,
             ekf=ekf,
             t_s=self._t_s,
+            hull_class=hull_class,
+            disturbance=ctx.disturbance,
         )
         return new_ctx
 
@@ -282,14 +324,16 @@ def _compute_omega(
     visibility_m: float,
     depth_m: float,
     draft_m: float,
+    n_contacts: int = 0,
 ) -> float:
     """Compute the Ω capability multiplier.
 
-    ω_risk  = 0.55 if risk > 0.85 else 0.78 if risk > 0.35 else 1.0
-    ω_fuel  = 0.70 if fuel < 0.20 else 1.0
-    ω_vis   = 0.80 if visibility_m < 200 else 1.0
-    ω_depth = 0.65 if depth_m < 3·draft_m else 1.0
-    Ω       = ω_risk × ω_fuel × ω_vis × ω_depth
+    ω_risk     = 0.55 if risk > 0.85 else 0.78 if risk > 0.35 else 1.0
+    ω_fuel     = 0.70 if fuel < 0.20 else 1.0
+    ω_vis      = 0.80 if visibility_m < 200 else 1.0
+    ω_depth    = 0.65 if depth_m < 3·draft_m else 1.0
+    ω_contacts = 0.90 if n_contacts >= 3 else 1.0
+    Ω          = ω_risk × ω_fuel × ω_vis × ω_depth × ω_contacts
     """
     if risk_score > 0.85:
         omega_risk = 0.55
@@ -298,11 +342,12 @@ def _compute_omega(
     else:
         omega_risk = 1.0
 
-    omega_fuel = 0.70 if fuel_level < 0.2 else 1.0
-    omega_vis = 0.80 if visibility_m < 200.0 else 1.0
-    omega_depth = 0.65 if depth_m < 3.0 * draft_m else 1.0
+    omega_fuel     = 0.70 if fuel_level < 0.2 else 1.0
+    omega_vis      = 0.80 if visibility_m < 200.0 else 1.0
+    omega_depth    = 0.65 if depth_m < 3.0 * draft_m else 1.0
+    omega_contacts = 0.90 if n_contacts >= 3 else 1.0
 
-    return omega_risk * omega_fuel * omega_vis * omega_depth
+    return omega_risk * omega_fuel * omega_vis * omega_depth * omega_contacts
 
 
 def _omega_to_verdict(omega: float) -> str:

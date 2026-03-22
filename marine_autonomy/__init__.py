@@ -23,13 +23,28 @@ from .contracts.schemas import (
     MarinePerception,
     VesselActuator,
     MarineTickContext,
+    HullClass,
+    DisturbanceState,
+    SubmarineState,
 )
-from .dynamics import VesselParams, vessel_step, vessel_step_rk4
-from .guidance import LOSGuidance, LOSConfig
+from .dynamics import (
+    VesselParams,
+    vessel_step,
+    vessel_step_rk4,
+    compute_disturbance_forces,
+    submarine_depth_step,
+    SubmarineFullState,
+    surface_vessel_params,
+    submarine_params,
+    yacht_params,
+    boat_params,
+    usv_params,
+)
+from .guidance import LOSGuidance, LOSConfig, DepthChart, maritime_astar
 from .estimation import MarineEKF, MarineEKFNoise, StateEstimate
 from .colregs import COLREGsBehavior, COLREGsConfig, classify_contact
 from .orchestrator import VesselOrchestrator
-from .presets import MarinePreset, get_preset, PRESET_REGISTRY
+from .presets import MarinePreset, get_preset, PRESET_REGISTRY, HULL_PRESETS, get_hull_preset
 
 __all__ = [
     # Contracts
@@ -39,13 +54,26 @@ __all__ = [
     "MarinePerception",
     "VesselActuator",
     "MarineTickContext",
+    "HullClass",
+    "DisturbanceState",
+    "SubmarineState",
     # Dynamics
     "VesselParams",
     "vessel_step",
     "vessel_step_rk4",
+    "compute_disturbance_forces",
+    "submarine_depth_step",
+    "SubmarineFullState",
+    "surface_vessel_params",
+    "submarine_params",
+    "yacht_params",
+    "boat_params",
+    "usv_params",
     # Guidance
     "LOSGuidance",
     "LOSConfig",
+    "DepthChart",
+    "maritime_astar",
     # Estimation
     "MarineEKF",
     "MarineEKFNoise",
@@ -60,6 +88,8 @@ __all__ = [
     "MarinePreset",
     "get_preset",
     "PRESET_REGISTRY",
+    "HULL_PRESETS",
+    "get_hull_preset",
 ]
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"

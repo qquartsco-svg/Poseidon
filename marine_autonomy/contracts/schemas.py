@@ -8,7 +8,50 @@ the Autonomy_Runtime_Stack sibling package.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Tuple, Optional, Any
+
+
+# ---------------------------------------------------------------------------
+# Hull class taxonomy
+# ---------------------------------------------------------------------------
+
+class HullClass(str, Enum):
+    """선체 분류 — 모든 해양 기체에 적용."""
+    SURFACE_VESSEL = "surface_vessel"   # 수상함 (3-DOF)
+    SUBMARINE      = "submarine"        # 잠수함 (4-DOF, depth control)
+    YACHT          = "yacht"            # 요트 (3-DOF, lightweight)
+    BOAT           = "boat"             # 보트 (3-DOF, high-speed)
+    AUTONOMOUS_USV = "autonomous_usv"   # 자율 무인수상정 (3-DOF)
+
+
+# ---------------------------------------------------------------------------
+# Environment disturbance state
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class DisturbanceState:
+    """외란 환경 상태 (파도·바람·조류)."""
+    wave_height_m: float = 0.0      # 유효 파고 (m)
+    wave_period_s: float = 8.0      # 파주기 (s)
+    wave_dir_rad: float  = 0.0      # 파향 (rad)
+    wind_speed_ms: float = 0.0      # 풍속 (m/s)
+    wind_dir_rad: float  = 0.0      # 풍향 (rad)
+    current_u_ms: float  = 0.0      # 조류 surge 성분 (m/s)
+    current_v_ms: float  = 0.0      # 조류 sway 성분 (m/s)
+    t_s: float           = 0.0      # 현재 시각 (s)
+
+
+# ---------------------------------------------------------------------------
+# Submarine-specific state
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class SubmarineState:
+    """잠수함 전용 상태 (수상함은 depth=0 고정)."""
+    depth_m: float  = 0.0    # 잠항 깊이 (m, 양수=수면하)
+    w_ms: float     = 0.0    # heave 속도 (m/s)
+    target_depth_m: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -118,6 +161,8 @@ class MarineTickContext:
     verdict      — Health verdict string
     ekf          — MarineEKF instance (optional)
     t_s          — Tick timestamp (s)
+    hull_class   — HullClass enum value (default: SURFACE_VESSEL)
+    disturbance  — DisturbanceState for environmental forces (optional)
     """
 
     state: Optional[Any] = None
@@ -130,3 +175,5 @@ class MarineTickContext:
     verdict: str = "HEALTHY"
     ekf: Optional[Any] = None
     t_s: float = 0.0
+    hull_class: HullClass = HullClass.SURFACE_VESSEL
+    disturbance: Optional[DisturbanceState] = None

@@ -1,5 +1,5 @@
 """
-COLREGs Rule 8/13/14/15/16 simplified FSM.
+COLREGs Rule 8/13/14/15/16 simplified FSM — multi-vessel simultaneous assessment.
 
 Situation classification (relative to own ship):
   HEAD_ON           — contact bearing < 15° AND courses opposing (diff > 150°)
@@ -19,6 +19,13 @@ FSM states:
   STAND_ON        — maintain course, monitor situation
   EMERGENCY_STOP  — contact inside emergency_range_m
 
+Multi-vessel algorithm:
+  1. All contacts are classified individually (HEAD_ON/CROSSING/OVERTAKING/SAFE)
+  2. EMERGENCY_STOP checked first (any contact d < emergency_range_m)
+  3. GIVE_WAY contacts collected — dominant (closest) determines avoidance direction
+  4. Multiple GIVE_WAY: largest avoidance angle applied
+  5. STAND_ON overridden by GIVE_WAY if any give-way contact also present
+
 Disclaimer:
   This implementation provides heuristic guidance only and is NOT a
   certified COLREGs compliance system.  All manoeuvres require confirmation
@@ -28,7 +35,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Dict
+from typing import Dict, Optional
 
 from .contracts.schemas import VesselState, ContactVessel, MarinePerception
 
@@ -57,6 +64,9 @@ class COLREGsConfig:
 # Helpers
 # ---------------------------------------------------------------------------
 
+_DEFAULT_CONFIG = COLREGsConfig()
+
+
 def _normalize_angle(a: float) -> float:
     """Wrap angle to (−π, π]."""
     while a > math.pi:
@@ -78,7 +88,7 @@ def _angle_diff(a: float, b: float) -> float:
 def classify_contact(
     ego_state: VesselState,
     contact: ContactVessel,
-    config: COLREGsConfig,
+    config: Optional[COLREGsConfig] = None,
 ) -> str:
     """Classify the encounter geometry between own ship and a contact.
 
@@ -91,8 +101,12 @@ def classify_contact(
       CROSSING:   bearing 10°–112.5° on own starboard  → GIVE_WAY
                   bearing 247.5°–350° on own port       → STAND_ON
       OVERTAKING: bearing 112.5°–247.5° (from astern)
+
+    config is optional; uses default COLREGsConfig if not supplied.
     """
-    if contact.range_m > config.safe_range_m:
+    cfg = config if config is not None else _DEFAULT_CONFIG
+
+    if contact.range_m > cfg.safe_range_m:
         return "SAFE"
 
     bearing = contact.bearing_rad  # relative bearing (rad)
@@ -127,17 +141,19 @@ def classify_contact(
 
 
 # ---------------------------------------------------------------------------
-# COLREGs FSM
+# COLREGs FSM — multi-vessel
 # ---------------------------------------------------------------------------
 
 class COLREGsBehavior:
     """Finite state machine that translates COLREGs encounters into
-    avoidance directives.
+    avoidance directives, supporting simultaneous multi-vessel assessment.
 
     Output dict from tick():
-      state               — FSM state string
+      state                    — FSM state string
       avoid_heading_offset_rad — additional heading bias to add to LOS output
-      stop                — True when EMERGENCY_STOP is active
+      stop                     — True when EMERGENCY_STOP is active
+      situations               — list[dict] per-contact situation info
+      dominant_contact         — id of most dangerous contact (or None)
     """
 
     def __init__(self) -> None:
@@ -151,65 +167,112 @@ class COLREGsBehavior:
         self,
         ego_state: VesselState,
         perception: MarinePerception,
-        config: COLREGsConfig,
+        config: Optional[COLREGsConfig] = None,
     ) -> Dict:
-        """Evaluate all contacts and return COLREGs directives.
+        """Evaluate all contacts simultaneously and return COLREGs directives.
 
-        Priority order (highest first):
-          1. EMERGENCY_STOP — any contact inside emergency_range_m
-          2. GIVE_WAY       — HEAD_ON or CROSSING_GIVE_WAY or OVERTAKING
-          3. STAND_ON       — CROSSING_STAND_ON
-          4. CRUISE         — all contacts safe / beyond action_range_m
-          5. STANDBY        — no contacts at all
+        Multi-vessel algorithm:
+          1. Classify every contact individually.
+          2. EMERGENCY_STOP first — any contact d < emergency_range_m.
+          3. Collect GIVE_WAY situations; pick dominant (closest) for direction.
+          4. Multiple GIVE_WAY: use maximum avoidance angle.
+          5. STAND_ON only when no GIVE_WAY present.
         """
-        emergency = False
-        give_way = False
-        stand_on = False
-        has_contacts = len(perception.contacts) > 0
-        avoid_offset = 0.0
+        cfg = config if config is not None else _DEFAULT_CONFIG
+        contacts = perception.contacts if hasattr(perception, "contacts") else ()
 
-        for contact in perception.contacts:
-            # Emergency stop overrides everything
-            if contact.range_m < config.emergency_range_m:
-                emergency = True
-                break
+        if not contacts:
+            self._state = "CRUISE"
+            return {
+                "state": "CRUISE",
+                "avoid_heading_offset_rad": 0.0,
+                "stop": False,
+                "situations": [],
+                "dominant_contact": None,
+            }
 
-            if contact.range_m > config.action_range_m:
-                continue
+        # Step 1: classify all contacts
+        situations = []
+        for c in contacts:
+            sit = classify_contact(ego_state, c, cfg)
+            situations.append({
+                "id": c.id,
+                "range_m": c.range_m,
+                "situation": sit,
+                "contact": c,
+            })
 
-            situation = classify_contact(ego_state, contact, config)
-
-            if situation == "HEAD_ON":
-                give_way = True
-                # Rule 14: alter to starboard — positive heading offset
-                avoid_offset = max(avoid_offset, config.give_way_offset_rad)
-
-            elif situation == "CROSSING_GIVE_WAY":
-                give_way = True
-                avoid_offset = max(avoid_offset, config.give_way_offset_rad)
-
-            elif situation == "OVERTAKING":
-                give_way = True
-                # Keep clear — alter to starboard
-                avoid_offset = max(avoid_offset, config.give_way_offset_rad)
-
-            elif situation == "CROSSING_STAND_ON":
-                stand_on = True
-
-        # --- FSM transition ---
-        if emergency:
+        # Step 2: emergency stop — any contact inside emergency range
+        emergency_contacts = [s for s in situations if s["range_m"] < cfg.emergency_range_m]
+        if emergency_contacts:
             self._state = "EMERGENCY_STOP"
-        elif give_way:
-            self._state = "GIVE_WAY"
-        elif stand_on:
-            self._state = "STAND_ON"
-        elif has_contacts:
-            self._state = "CRUISE"
-        else:
-            self._state = "CRUISE"
+            return {
+                "state": "EMERGENCY_STOP",
+                "avoid_heading_offset_rad": 0.0,
+                "stop": True,
+                "situations": situations,
+                "dominant_contact": emergency_contacts[0]["id"],
+            }
 
+        # Step 3: filter to action range
+        active = [s for s in situations if s["range_m"] < cfg.action_range_m]
+
+        # Step 4: separate give-way and stand-on
+        give_way = [
+            s for s in active
+            if s["situation"] in ("HEAD_ON", "OVERTAKING", "CROSSING_GIVE_WAY")
+        ]
+        stand_on = [
+            s for s in active
+            if s["situation"] == "CROSSING_STAND_ON"
+        ]
+
+        if give_way:
+            # Dominant = closest
+            dominant = min(give_way, key=lambda x: x["range_m"])
+            sit_type = dominant["situation"]
+
+            # Primary avoidance offset
+            if sit_type == "HEAD_ON":
+                offset = math.radians(20.0)
+            elif sit_type == "CROSSING_GIVE_WAY":
+                offset = math.radians(15.0)
+            else:  # OVERTAKING
+                offset = math.radians(10.0)
+
+            # Multiple give-way: take the maximum
+            for s in give_way[1:]:
+                if s["situation"] == "HEAD_ON":
+                    offset = max(offset, math.radians(20.0))
+                elif s["situation"] == "CROSSING_GIVE_WAY":
+                    offset = max(offset, math.radians(15.0))
+                else:
+                    offset = max(offset, math.radians(10.0))
+
+            self._state = "GIVE_WAY"
+            return {
+                "state": "GIVE_WAY",
+                "avoid_heading_offset_rad": offset,
+                "stop": False,
+                "situations": situations,
+                "dominant_contact": dominant["id"],
+            }
+
+        if stand_on:
+            self._state = "STAND_ON"
+            return {
+                "state": "STAND_ON",
+                "avoid_heading_offset_rad": 0.0,
+                "stop": False,
+                "situations": situations,
+                "dominant_contact": stand_on[0]["id"],
+            }
+
+        self._state = "CRUISE"
         return {
-            "state": self._state,
-            "avoid_heading_offset_rad": avoid_offset if not emergency else 0.0,
-            "stop": emergency,
+            "state": "CRUISE",
+            "avoid_heading_offset_rad": 0.0,
+            "stop": False,
+            "situations": situations,
+            "dominant_contact": None,
         }
